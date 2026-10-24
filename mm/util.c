@@ -12,6 +12,7 @@
 #include <linux/hugetlb.h>
 #include <linux/vmalloc.h>
 #include <linux/random.h>
+#include <linux/file.h>
 
 #include <asm/sections.h>
 #include <asm/uaccess.h>
