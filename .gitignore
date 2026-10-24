@@ -19,6 +19,7 @@
 *.so.dbg
 *.mod.c
 *.i
+!drivers/input/touchscreen/ft5435/*.i
 *.lst
 *.symtypes
 *.order
