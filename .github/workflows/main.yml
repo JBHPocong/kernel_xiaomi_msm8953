@@ -1,4 +1,4 @@
-name: Build Kernel
+name: Build MayatSilicon
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         type: string
 
       kernelname:
-        description: "Kernel name"
+        description: "Kernel defconfig name"
         required: true
         default: "msm8953-perf"
         type: string
@@ -31,46 +31,107 @@ jobs:
       KERNELNAME: ${{ inputs.kernelname }}
 
     steps:
+      # ========================================
+      # CHECKOUT
+      # ========================================
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.branch }}
 
+      # ========================================
+      # DEPENDENCIES
+      # ========================================
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            bc bison flex libssl-dev build-essential \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-            gcc-arm-linux-gnueabihf python3 aria2 cpio \
-            zip unzip git curl wget
 
+          sudo apt-get install -y \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            gcc-arm-linux-gnueabihf \
+            python3 \
+            aria2 \
+            cpio \
+            zip \
+            unzip \
+            git \
+            curl \
+            wget \
+            libelf-dev \
+            dwarves \
+            lz4 \
+            zstd
+
+      # ========================================
+      # BAKASU
+      # ========================================
       - name: Setup BakaSU
         run: |
-          curl -LSs https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh | bash
+          curl -LSs \
+            https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh \
+            | bash
 
+      # ========================================
+      # KERNELSU MANUAL HOOKS
+      # ========================================
       - name: Apply KernelSU manual hooks
         run: |
-          python3 ksu_manual_hook_patch.py .
+          set -e
 
-      - name: Clone AOSP Clang 20
+          if [ -f ksu_manual_hook_patch.py ]; then
+            python3 ksu_manual_hook_patch.py .
+          else
+            echo "WARNING: ksu_manual_hook_patch.py not found"
+            echo "Skipping manual KernelSU hooks"
+          fi
+
+      # ========================================
+      # CLANG 20
+      # ========================================
+      - name: Download AOSP Clang 20
         run: |
-          mkdir -p prebuilts/clang/host/linux-x86/clang-r547379
+          set -e
 
-          aria2c -x 16 -s 16 -k 1M \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz
+          CLANG_DIR="prebuilts/clang/host/linux-x86/clang-r547379"
+
+          mkdir -p "$CLANG_DIR"
+
+          aria2c \
+            -x 16 \
+            -s 16 \
+            -k 1M \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz \
+            -o clang-r547379.tar.gz
 
           tar -xzf clang-r547379.tar.gz \
-            -C prebuilts/clang/host/linux-x86/clang-r547379
+            -C "$CLANG_DIR"
 
+          chmod +x "$CLANG_DIR/bin/"*
+
+      # ========================================
+      # ENVIRONMENT
+      # ========================================
       - name: Export build environment
         run: |
           echo "KERNEL_DIR=$PWD" >> "$GITHUB_ENV"
+
           echo "CLANG_PATH=$PWD/prebuilts/clang/host/linux-x86/clang-r547379/bin" >> "$GITHUB_ENV"
+
           echo "PATH=$PWD/prebuilts/clang/host/linux-x86/clang-r547379/bin:$PATH" >> "$GITHUB_ENV"
 
+      # ========================================
+      # BUILD KERNEL
+      # ========================================
       - name: Build kernel
         run: |
+          set -e
+
           export ARCH=arm64
           export SUBARCH=arm64
 
@@ -94,30 +155,83 @@ jobs:
 
           mkdir -p out
 
-          echo "Building branch: ${{ inputs.branch }}"
-          echo "Config: ${CONFIG}"
+          echo "========================================"
+          echo "MayatSilicon Kernel Build"
+          echo "========================================"
+
+          echo "Branch: ${{ inputs.branch }}"
           echo "Kernel: ${KERNELNAME}"
+          echo "Config: ${CONFIG}"
+          echo "========================================"
 
-          make O=out "${KERNELNAME}_defconfig"
+          # ----------------------------------------
+          # SEARCH DEFCONFIG
+          # ----------------------------------------
 
-          if [ -f "vendor/xiaomi/${CONFIG}" ]; then
-            scripts/kconfig/merge_config.sh \
-              -O out \
-              out/.config \
-              "vendor/xiaomi/${CONFIG}"
+          DEFCONFIG="${KERNELNAME}_defconfig"
 
-            make O=out olddefconfig
-          elif [ -f "${CONFIG}" ]; then
-            scripts/kconfig/merge_config.sh \
-              -O out \
-              out/.config \
-              "${CONFIG}"
+          echo "Searching for ${DEFCONFIG}..."
 
-            make O=out olddefconfig
-          else
-            echo "ERROR: Config fragment not found: ${CONFIG}"
+          DEFCONFIG_PATH=$(find arch/arm64/configs \
+            -type f \
+            -name "${DEFCONFIG}" \
+            -print -quit 2>/dev/null || true)
+
+          if [ -z "$DEFCONFIG_PATH" ]; then
+            echo "ERROR: ${DEFCONFIG} not found!"
             exit 1
           fi
+
+          echo "Defconfig found:"
+          echo "$DEFCONFIG_PATH"
+
+          DEFCONFIG_TARGET="${DEFCONFIG_PATH#arch/arm64/configs/}"
+          DEFCONFIG_TARGET="${DEFCONFIG_TARGET%.defconfig}"
+
+          echo "Defconfig target:"
+          echo "$DEFCONFIG_TARGET"
+
+          # ----------------------------------------
+          # DEFCONFIG
+          # ----------------------------------------
+
+          make O=out "$DEFCONFIG_TARGET"
+
+          # ----------------------------------------
+          # SEARCH CONFIG FRAGMENT
+          # ----------------------------------------
+
+          echo "Searching for ${CONFIG}..."
+
+          CONFIG_PATH=$(find . \
+            -type f \
+            -name "${CONFIG}" \
+            -not -path "./out/*" \
+            -not -path "./.git/*" \
+            -print -quit 2>/dev/null || true)
+
+          if [ -z "$CONFIG_PATH" ]; then
+            echo "ERROR: Config fragment ${CONFIG} not found!"
+            exit 1
+          fi
+
+          echo "Config fragment found:"
+          echo "$CONFIG_PATH"
+
+          # ----------------------------------------
+          # MERGE CONFIG
+          # ----------------------------------------
+
+          scripts/kconfig/merge_config.sh \
+            -O out \
+            out/.config \
+            "$CONFIG_PATH"
+
+          make O=out olddefconfig
+
+          # ----------------------------------------
+          # BUILD
+          # ----------------------------------------
 
           make -j"$(nproc --all)" O=out \
             ARCH=arm64 \
@@ -126,56 +240,109 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1
 
+          # ----------------------------------------
+          # KERNEL VERSION
+          # ----------------------------------------
+
+          KERNEL_VERSION=$(make kernelversion)
+
+          echo "KERNEL_VERSION=$KERNEL_VERSION" >> "$GITHUB_ENV"
+
+          echo "========================================"
+          echo "Build completed"
+          echo "Kernel version: $KERNEL_VERSION"
+          echo "========================================"
+
+      # ========================================
+      # VERIFY OUTPUT
+      # ========================================
       - name: Verify kernel output
         run: |
+          set -e
+
+          echo "Kernel output directory:"
           ls -lh out/arch/arm64/boot/
 
-          test -f out/arch/arm64/boot/Image.gz
+          if [ ! -f out/arch/arm64/boot/Image.gz ]; then
+            echo "ERROR: Image.gz not found!"
+            exit 1
+          fi
+
+          echo "Image.gz found"
 
           if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
             echo "Image.gz-dtb found"
           else
-            echo "Image.gz-dtb not found"
+            echo "Image.gz-dtb unavailable"
           fi
 
+      # ========================================
+      # ANYKERNEL3
+      # ========================================
       - name: Clone AnyKernel3
         run: |
           git clone \
             https://github.com/rahmatsobrian/AnyKernel3.git \
-            -b tissot AnyKernel
+            -b tissot \
+            AnyKernel
 
+      # ========================================
+      # PACKAGE IMAGE.GZ
+      # ========================================
       - name: Package Image.gz
         run: |
-          cp out/arch/arm64/boot/Image.gz AnyKernel/
+          set -e
+
+          DATE=$(date +%Y%m%d)
+
+          cp out/arch/arm64/boot/Image.gz \
+            AnyKernel/Image.gz
 
           cd AnyKernel
 
-          zip -r9 ../test1-${KERNELNAME}-$(date +%Y%m%d).zip . \
+          zip -r9 \
+            ../MayatSilicon-${KERNELNAME}-Image.gz-${DATE}.zip \
+            . \
             -x ".git/*"
 
+      # ========================================
+      # PACKAGE IMAGE.GZ-DTB
+      # ========================================
       - name: Package Image.gz-dtb
         run: |
+          set -e
+
+          DATE=$(date +%Y%m%d)
+
           if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
-            echo "Image.gz-dtb unavailable, skipping"
+            echo "Image.gz-dtb unavailable"
+            echo "Skipping package"
+
             exit 0
           fi
 
           rm -f AnyKernel/Image.gz
 
-          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel/
+          cp out/arch/arm64/boot/Image.gz-dtb \
+            AnyKernel/Image.gz-dtb
 
           cd AnyKernel
 
-          zip -r9 ../test2-${KERNELNAME}-$(date +%Y%m%d).zip . \
+          zip -r9 \
+            ../MayatSilicon-${KERNELNAME}-Image.gz-dtb-${DATE}.zip \
+            . \
             -x ".git/*"
 
+      # ========================================
+      # UPLOAD ARTIFACTS
+      # ========================================
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-${{ inputs.kernelname }}-${{ inputs.branch }}
+          name: MayatSilicon-${{ inputs.kernelname }}-${{ inputs.branch }}
           path: |
-            test1-${{ inputs.kernelname }}-*.zip
-            test2-${{ inputs.kernelname }}-*.zip
+            MayatSilicon-${{ inputs.kernelname }}-Image.gz-*.zip
+            MayatSilicon-${{ inputs.kernelname }}-Image.gz-dtb-*.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
