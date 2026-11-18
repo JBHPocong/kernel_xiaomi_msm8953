@@ -59,7 +59,7 @@ jobs:
         continue-on-error: true
         run: |
           curl -LSs \
-            https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh \
+            https://raw.githubusercontent.com/JBHPocong/BakaSU/main/kernel/setup.sh \
             | bash || echo "WARNING: BakaSU setup failed, continuing..."
 
       # ========================================
