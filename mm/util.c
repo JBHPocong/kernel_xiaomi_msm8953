@@ -1,3 +1,4 @@
+#include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
