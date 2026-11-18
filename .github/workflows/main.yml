@@ -203,11 +203,9 @@ jobs:
 
           echo "Searching for ${CONFIG}..."
 
-          CONFIG_PATH=$(find . \
+          CONFIG_PATH=$(find arch/arm64/configs \
             -type f \
             -name "${CONFIG}" \
-            -not -path "./out/*" \
-            -not -path "./.git/*" \
             -print -quit 2>/dev/null || true)
 
           if [ -z "$CONFIG_PATH" ]; then
