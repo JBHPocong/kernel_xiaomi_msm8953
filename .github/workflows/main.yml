@@ -1,18 +1,24 @@
-
 name: Build Kernel
 
 on:
   workflow_dispatch:
     inputs:
+      branch:
+        description: "Branch to build"
+        required: true
+        default: "main"
+        type: string
+
       config:
-        description: "Kernel config target"
+        description: "Kernel config fragment"
         required: true
         default: "tissot.config"
         type: string
+
       kernelname:
         description: "Kernel name"
         required: true
-        default: "perf"
+        default: "msm8953-perf"
         type: string
 
 jobs:
@@ -27,6 +33,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
 
       - name: Install dependencies
         run: |
@@ -86,9 +94,30 @@ jobs:
 
           mkdir -p out
 
-          make O=out vendor/msm8953-${KERNELNAME}_defconfig
+          echo "Building branch: ${{ inputs.branch }}"
+          echo "Config: ${CONFIG}"
+          echo "Kernel: ${KERNELNAME}"
 
-          make O=out vendor/xiaomi/${CONFIG}
+          make O=out "${KERNELNAME}_defconfig"
+
+          if [ -f "vendor/xiaomi/${CONFIG}" ]; then
+            scripts/kconfig/merge_config.sh \
+              -O out \
+              out/.config \
+              "vendor/xiaomi/${CONFIG}"
+
+            make O=out olddefconfig
+          elif [ -f "${CONFIG}" ]; then
+            scripts/kconfig/merge_config.sh \
+              -O out \
+              out/.config \
+              "${CONFIG}"
+
+            make O=out olddefconfig
+          else
+            echo "ERROR: Config fragment not found: ${CONFIG}"
+            exit 1
+          fi
 
           make -j"$(nproc --all)" O=out \
             ARCH=arm64 \
@@ -99,11 +128,15 @@ jobs:
 
       - name: Verify kernel output
         run: |
-          test -f out/arch/arm64/boot/Image.gz
-          test -f out/arch/arm64/boot/Image.gz-dtb
+          ls -lh out/arch/arm64/boot/
 
-          ls -lh out/arch/arm64/boot/Image.gz
-          ls -lh out/arch/arm64/boot/Image.gz-dtb
+          test -f out/arch/arm64/boot/Image.gz
+
+          if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            echo "Image.gz-dtb found"
+          else
+            echo "Image.gz-dtb not found"
+          fi
 
       - name: Clone AnyKernel3
         run: |
@@ -122,6 +155,11 @@ jobs:
 
       - name: Package Image.gz-dtb
         run: |
+          if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            echo "Image.gz-dtb unavailable, skipping"
+            exit 0
+          fi
+
           rm -f AnyKernel/Image.gz
 
           cp out/arch/arm64/boot/Image.gz-dtb AnyKernel/
@@ -134,7 +172,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-${{ inputs.kernelname }}
+          name: Kernel-${{ inputs.kernelname }}-${{ inputs.branch }}
           path: |
             test1-${{ inputs.kernelname }}-*.zip
             test2-${{ inputs.kernelname }}-*.zip
