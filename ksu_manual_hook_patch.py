@@ -1,50 +1,41 @@
+
 #!/usr/bin/env python3
 """
-Adaptive KernelSU Manual Hook + BakaSU SELinux Patcher
+KernelSU Manual Hook + BakaSU SELinux Static Symbol Export patcher
+for Linux Kernel 4.9.x.
 
-Matching policy (UNCHANGED - original logic):
-- similarity >= 0.90  -> STRONG, auto-accept
-- 0.75 <= sim < 0.90  -> PARTIAL, candidate only (NOT auto-patched)
-- 0.50 <= sim < 0.75  -> WEAK, logged, rejected
-- similarity < 0.50   -> IGNORED
+Manual Hooks:
+    fs/exec.c
+    fs/open.c
+    kernel/reboot.c
+    fs/stat.c
 
-Fixes vs. original:
-- fs/stat.c: detection is per-symbol. The original only checked
-  "ksu_handle_stat", so on kernels where ksu_handle_stat was already
-  declared but ksu_handle_newfstat_ret / ksu_handle_fstat64_ret were
-  not, the whole STAT_DECLS block was skipped, causing
-  -Werror=implicit-function-declaration at compile time.
-- Insertion is still a FULL BLOCK (guards intact). Only the extern
-  statements for symbols that are already present are stripped.
-  This keeps #if defined(__ARCH_WANT_STAT64) / __ARCH_WANT_COMPAT_STAT64
-  guards intact, so kernels without struct stat64 are not broken.
-- validate_patch() checks that every called KSU symbol in fs/stat.c
-  has a visible extern declaration.
+BakaSU SELinux:
+    security/selinux/selinuxfs.c
+    security/selinux/ss/status.c
+    security/selinux/ss/services.c
+    security/selinux/hooks.c
 
 Features:
-- Adaptive source matching
-- Similarity scoring
-- Reference-based matching
-- Function signature matching with whitespace tolerance
-- Automatic Manual Hook integration
-- Legacy vfs_read hook removal
-- BakaSU SELinux static symbol export
-- Idempotent
-- Timestamped backups
-- Transactional patching
-- Rollback on failure
-- Dry-run mode
-- Detailed patch report
+    - Kernel 4.9.x targeted
+    - Adaptive declaration detection
+    - Per-symbol declaration validation
+    - Automatic patching
+    - Timestamped backups
+    - Optional syscall support
+    - Required symbols validated
+    - All patches prepared before writing
+    - Rollback on write failure
+    - Already patched symbols detected
+    - Partial patch detection
+    - No duplicate hook insertion
 
 Usage:
-    python3 ksu_manual_hook_patch.py .
+    python3 ksu_manual_hook_patch.py
     python3 ksu_manual_hook_patch.py /path/to/kernel
-    python3 ksu_manual_hook_patch.py . --dry-run
-    python3 ksu_manual_hook_patch.py . --threshold 0.85
 """
 
 import argparse
-import difflib
 import re
 import shutil
 import sys
@@ -53,850 +44,905 @@ from pathlib import Path
 
 
 # ============================================================
-# CONFIGURATION
+# UTILITIES
 # ============================================================
-
-DEFAULT_THRESHOLD = 0.85
-
-REFERENCE_THRESHOLD = 0.90
-PARTIAL_THRESHOLD = 0.75
-MINIMUM_THRESHOLD = 0.50
-
-REPORT = []
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-def log(level, message):
-    print(f"[{level}] {message}")
-    REPORT.append((level, message))
-
 
 def abort(message):
     raise RuntimeError(message)
 
 
-# ============================================================
-# NORMALIZATION
-# ============================================================
+def print_info(message):
+    print(f"[INFO] {message}")
 
-def normalize_code(code):
+
+def print_patch(message):
+    print(f"[PATCH] {message}")
+
+
+def print_skip(message):
+    print(f"[SKIP] {message}")
+
+
+def print_ok(message):
+    print(f"[OK] {message}")
+
+
+def normalize_whitespace(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def insert_before_once(text, anchor, addition, label):
+
+    count = text.count(anchor)
+
+    if count != 1:
+        abort(
+            f"{label}: expected exactly one insertion point, "
+            f"found {count}"
+        )
+
+    return text.replace(
+        anchor,
+        addition.rstrip() + "\n\n" + anchor,
+        1
+    )
+
+
+def insert_declarations(
+    text,
+    declarations,
+    anchor,
+    label
+):
     """
-    Normalize source code for similarity comparison.
+    Insert only missing declarations.
 
-    Removes:
-    - whitespace differences
-    - comments
-    - unnecessary formatting differences
+    Declaration detection is performed independently
+    for every symbol.
 
-    Does NOT remove:
-    - identifiers
-    - operators
-    - function names
-    - structural tokens
-    """
-
-    code = re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
-    code = re.sub(r"//[^\n]*", "", code)
-    code = re.sub(r"\s+", "", code)
-    return code
-
-
-def similarity(a, b):
-    """
-    Return similarity ratio between two code fragments.
-    """
-
-    a = normalize_code(a)
-    b = normalize_code(b)
-
-    if not a or not b:
-        return 0.0
-
-    return difflib.SequenceMatcher(None, a, b).ratio()
-
-
-def compare_reference(source, reference, threshold=DEFAULT_THRESHOLD,
-                      label="reference"):
-    """
-    Compare source against a reference implementation.
-
-    High similarity:
-        Accept reference.
-
-    Medium similarity:
-        Candidate only.
-
-    Low similarity:
-        Reject reference.
+    A function call does not count as a declaration.
     """
 
-    score = similarity(source, reference)
+    missing = []
 
-    if score >= REFERENCE_THRESHOLD:
-        log("REFERENCE", f"{label}: similarity={score:.2%}, strong match")
-        return "strong", score
+    for symbol, declaration in declarations:
 
-    if score >= PARTIAL_THRESHOLD:
-        log("REFERENCE", f"{label}: similarity={score:.2%}, partial match")
-        return "partial", score
+        declaration_pattern = re.compile(
+            r"(?m)^[ \t]*(?:extern\s+)?"
+            r"[^;\n]*\b"
+            + re.escape(symbol)
+            + r"\s*\([^;]*\)\s*;"
+        )
 
-    if score >= MINIMUM_THRESHOLD:
-        log("REFERENCE", f"{label}: similarity={score:.2%}, weak match")
-        return "weak", score
+        if declaration_pattern.search(text):
 
-    log("REFERENCE", f"{label}: similarity={score:.2%}, ignored")
-    return "ignored", score
+            print_skip(
+                f"{label}: declaration already exists "
+                f"for {symbol}"
+            )
+
+        else:
+
+            missing.append(declaration)
+
+    if not missing:
+        return text
+
+    addition = (
+        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+        + "\n".join(missing)
+        + "\n#endif"
+    )
+
+    text = insert_before_once(
+        text,
+        anchor,
+        addition,
+        label
+    )
+
+    for declaration in missing:
+        print_patch(
+            f"{label}: inserted declaration"
+        )
+
+    return text
 
 
-# ============================================================
-# STRUCTURAL MATCHING
-# ============================================================
+def function_bounds(text, signature):
 
-def find_function(text, signature_pattern, label=None):
-    """
-    Find function using regex signature.
+    start = text.find(signature)
 
-    Whitespace and line breaks are ignored.
-    """
+    if start < 0:
+        abort(
+            f"Function not found: {signature}"
+        )
 
-    match = re.search(signature_pattern, text, re.MULTILINE | re.DOTALL)
-
-    if not match:
-        if label:
-            log("SKIP", f"Function not found: {label}")
-        return None
-
-    start = match.start()
-    brace = text.find("{", match.end())
+    brace = text.find("{", start)
 
     if brace < 0:
-        return None
+        abort(
+            f"Opening brace not found: {signature}"
+        )
 
     depth = 0
 
     for pos in range(brace, len(text)):
+
         char = text[pos]
 
         if char == "{":
             depth += 1
+
         elif char == "}":
             depth -= 1
+
             if depth == 0:
-                return (start, pos + 1, text[start:pos + 1])
+                return start, pos + 1
 
-    return None
-
-
-def find_function_by_name(text, function_name):
-    """
-    Generic function finder.
-
-    Allows:
-        static int foo(...)
-        int foo(...)
-        __attribute__((...)) int foo(...)
-    """
-
-    pattern = (
-        r"\b" + re.escape(function_name) + r"\s*\([^;]*?\)\s*\{"
+    abort(
+        f"Unclosed function: {signature}"
     )
 
-    return find_function(text, pattern, function_name)
 
-
-def replace_function(text, bounds, new_block):
-    start, end, old_block = bounds
-    return text[:start] + new_block + text[end:]
-
-
-# ============================================================
-# ADAPTIVE ANCHOR MATCHER  (ORIGINAL LOGIC - UNCHANGED)
-# ============================================================
-
-def find_anchor(block, reference, threshold=DEFAULT_THRESHOLD,
-                label="anchor"):
-    """
-    Find a source line matching the reference.
-
-    Exact match:
-        accepted
-
-    Similarity >= threshold:
-        accepted
-
-    Similarity between 0.75 and threshold:
-        candidate, not automatically accepted
-
-    Similarity below 0.75:
-        rejected
-    """
-
-    lines = block.splitlines()
-    reference_normalized = normalize_code(reference)
-
-    candidates = []
-
-    for index, line in enumerate(lines):
-        normalized = normalize_code(line)
-
-        if not normalized:
-            continue
-
-        score = difflib.SequenceMatcher(
-            None, normalized, reference_normalized
-        ).ratio()
-
-        candidates.append((score, index, line))
-
-    candidates.sort(reverse=True)
-
-    if not candidates:
-        log("SKIP", f"No candidate anchor: {label}")
-        return None
-
-    best_score, best_index, best_line = candidates[0]
-
-    if best_score >= threshold:
-        log("MATCH", f"{label}: {best_score:.2%}")
-        return best_index
-
-    if best_score >= PARTIAL_THRESHOLD:
-        log("REVIEW", f"{label}: {best_score:.2%}; not automatically patched")
-        return None
-
-    log("SKIP", f"{label}: similarity too low ({best_score:.2%})")
-    return None
-
-
-# ============================================================
-# SAFE INSERTION
-# ============================================================
-
-def insert_before_anchor(block, anchor, addition, label,
-                         threshold=DEFAULT_THRESHOLD):
-    lines = block.splitlines()
-    index = find_anchor(block, anchor, threshold, label)
-
-    if index is None:
-        return block, False
-
-    lines.insert(index, addition)
-    return "\n".join(lines), True
-
-
-def replace_anchor(block, anchor, replacement, label,
-                   threshold=DEFAULT_THRESHOLD):
-    lines = block.splitlines()
-    index = find_anchor(block, anchor, threshold, label)
-
-    if index is None:
-        return block, False
-
-    lines[index] = replacement
-    return "\n".join(lines), True
-
-
-# ============================================================
-# DECLARATIONS
-# ============================================================
-
-EXEC_DECLS = r"""
-#ifdef CONFIG_KSU_MANUAL_HOOK
-__attribute__((hot))
-extern int ksu_handle_execveat(
-    int *fd,
-    struct filename **filename_ptr,
-    void *argv,
-    void *envp,
-    int *flags
-);
-
-__attribute__((hot))
-extern int ksu_handle_post_execveat(
-    int *fd,
-    struct filename **filename_ptr,
-    void *argv,
-    void *envp,
-    int *flags,
-    int *retval
-);
-#endif
-"""
-
-OPEN_DECLS = r"""
-#ifdef CONFIG_KSU_MANUAL_HOOK
-__attribute__((hot))
-extern int ksu_handle_faccessat(
-    int *dfd,
-    const char __user **filename_user,
-    int *mode,
-    int *flags
-);
-#endif
-"""
-
-STAT_DECLS = r"""
-#ifdef CONFIG_KSU_MANUAL_HOOK
-__attribute__((hot))
-extern int ksu_handle_stat(
-    int *dfd,
-    const char __user **filename_user,
-    int *flags
-);
-
-extern void ksu_handle_newfstat_ret(
-    unsigned int *fd,
-    struct stat __user **statbuf_ptr
-);
-
-#if defined(__ARCH_WANT_STAT64) || \
-    defined(__ARCH_WANT_COMPAT_STAT64)
-
-extern void ksu_handle_fstat64_ret(
-    unsigned long *fd,
-    struct stat64 __user **statbuf_ptr
-);
-
-#endif
-#endif
-"""
-
-REBOOT_DECLS = r"""
-#ifdef CONFIG_KSU_MANUAL_HOOK
-extern int ksu_handle_sys_reboot(
-    int magic1,
-    int magic2,
-    unsigned int cmd,
-    void __user **arg
-);
-#endif
-"""
-
-
-# ============================================================
-# DECLARATION INSERTION  (FIXED - cross-version safe)
-# ============================================================
-
-def _strip_present_declarations(declaration, present_symbols):
-    """
-    Remove only the 'extern ... sym ... ;' statements for present_symbols
-    from the declaration block, leaving #if/#endif/#else lines untouched.
-
-    This keeps guards (e.g. __ARCH_WANT_STAT64) intact, so kernels that
-    do not define struct stat64 will still compile.
-
-    Returns the stripped block (possibly empty).
-    """
-
-    lines = declaration.splitlines(keepends=True)
-    out = []
-    i = 0
-    n = len(lines)
-
-    while i < n:
-        line = lines[i]
-
-        # Detect the start of an extern statement for a present symbol.
-        if re.match(r"\s*extern\b", line):
-            stmt_lines = [line]
-            j = i
-
-            # Accumulate until the terminating ';' (may span lines).
-            while ";" not in lines[j] and j + 1 < n:
-                j += 1
-                stmt_lines.append(lines[j])
-
-            stmt = "".join(stmt_lines)
-            stmt_syms = set(re.findall(r"\bksu_\w+\b", stmt))
-
-            if stmt_syms & present_symbols:
-                # Drop this extern statement entirely.
-                # Also drop a preceding bare "__attribute__((hot))" line
-                # if it directly precedes the extern and is on its own.
-                if out and out[-1].strip() == "__attribute__((hot))":
-                    out.pop()
-                i = j + 1
-                continue
-
-            out.extend(stmt_lines)
-            i = j + 1
-            continue
-
-        out.append(line)
-        i += 1
-
-    result = "".join(out)
-
-    # Collapse empty #if blocks produced by stripping:
-    #   #if ...\n#endif
-    # Repeat until stable to handle nested empties.
-    prev = None
-    while prev != result:
-        prev = result
-        result = re.sub(r"#if[^\n]*\n\s*#endif\s*\n", "", result)
-
-    return result
-
-
-def insert_declaration(text, declaration, anchor_pattern, label):
-    """
-    Insert declaration block if ANY symbol is missing.
-
-    Policy (cross-version safe):
-    - If ALL symbols present -> skip.
-    - If NO symbols present  -> insert the FULL block (guards intact).
-    - If SOME symbols present -> insert the FULL block but with the
-      already-present symbols' extern statements stripped. All #if/#endif
-      guards are preserved exactly as written in the original block.
-
-    This fixes the original bug (skipping the whole block because one
-    symbol existed) without risking unguarded fragments (e.g. struct
-    stat64 on kernels that don't define it).
-    """
-
-    declared_symbols = set(re.findall(r"\bksu_\w+\b", declaration))
-
-    if not declared_symbols:
-        log("SKIP", f"{label}: no symbols in declaration")
-        return text
-
-    present = {s for s in declared_symbols if s in text}
-    missing = declared_symbols - present
-
-    if not missing:
-        log("SKIP", f"{label}: all declarations already present")
-        return text
-
-    if not present:
-        block = declaration
-    else:
-        block = _strip_present_declarations(declaration, present)
-
-    if not block.strip():
-        log("SKIP", f"{label}: nothing left after stripping present decls")
-        return text
-
-    match = re.search(anchor_pattern, text, re.MULTILINE)
-
-    if not match:
-        log("SKIP", f"{label}: insertion anchor not found")
-        return text
-
-    log(
-        "PATCH",
-        f"{label}: inserting block "
-        f"(missing: {', '.join(sorted(missing))})",
-    )
-
-    return text[:match.start()] + block + "\n" + text[match.start():]
-
-
-# ============================================================
-# PATCH FUNCTION
-# ============================================================
-
-def patch_function_adaptive(
+def patch_function(
     text,
-    signature_pattern,
-    reference_anchor,
-    replacement,
-    hook_name,
-    label,
-    threshold=DEFAULT_THRESHOLD,
+    signature,
+    old,
+    new,
+    hook_name
 ):
 
-    # Already patched?
-    if hook_name in text:
-        log("SKIP", f"{label}: hook already exists")
-        return text
-
-    bounds = find_function(text, signature_pattern, label)
-
-    if bounds is None:
-        log("SKIP", f"{label}: function not found")
-        return text
-
-    start, end, block = bounds
-
-    # Find matching anchor
-    index = find_anchor(block, reference_anchor, threshold, label)
-
-    if index is None:
-        log("SKIP", f"{label}: no safe insertion point")
-        return text
-
-    lines = block.splitlines()
-    lines.insert(index, replacement)
-    new_block = "\n".join(lines)
-
-    log("PATCH", label)
-
-    return text[:start] + new_block + text[end:]
-
-
-# ============================================================
-# FS/EXEC.C
-# ============================================================
-
-def patch_exec(text):
-
-    signature = r"int\s+do_execve\s*\(\s*struct\s+filename\s*\*filename,"
-
-    reference = (
-        "return do_execveat_common("
-        "AT_FDCWD, filename, argv, envp, 0);"
+    start, end = function_bounds(
+        text,
+        signature
     )
 
-    replacement = r"""
-#ifdef CONFIG_KSU_MANUAL_HOOK
-    int retval;
+    block = text[start:end]
 
-    ksu_handle_execveat(
-        (int *)AT_FDCWD,
-        &filename,
-        &argv,
-        &envp,
-        0
-    );
+    # --------------------------------------------------------
+    # ALREADY PATCHED
+    # --------------------------------------------------------
 
-    retval = do_execveat_common(
-        AT_FDCWD,
-        filename,
-        argv,
-        envp,
-        0
-    );
+    if hook_name in block:
 
-    ksu_handle_post_execveat(
-        (int *)AT_FDCWD,
-        &filename,
-        &argv,
-        &envp,
-        0,
-        &retval
-    );
+        if new.strip() in block:
 
-    return retval;
-#else
-    return do_execveat_common(
-        AT_FDCWD,
-        filename,
-        argv,
-        envp,
-        0
-    );
-#endif
-"""
-
-    if "ksu_handle_execveat" not in text:
-        text = insert_declaration(
-            text, EXEC_DECLS,
-            r"int\s+do_execve\s*\(",
-            "exec declarations",
-        )
-
-    return patch_function_adaptive(
-        text, signature, reference, replacement,
-        "ksu_handle_execveat", "do_execve",
-    )
-
-
-# ============================================================
-# FS/OPEN.C
-# ============================================================
-
-def patch_open(text):
-
-    if "ksu_handle_faccessat" not in text:
-        text = insert_declaration(
-            text, OPEN_DECLS,
-            r"/\*\s*\n\s*\*\s*access\(\)",
-            "open declarations",
-        )
-
-    signature = (
-        r"SYSCALL_DEFINE3\s*\(\s*faccessat\s*,"
-        r"\s*int\s*,\s*dfd\s*,"
-        r"\s*const\s+char\s+__user\s*\*,"
-        r"\s*filename\s*,"
-        r"\s*int\s*,\s*mode\s*\)"
-    )
-
-    return patch_function_adaptive(
-        text, signature,
-        "if (mode & ~S_IRWXO)",
-        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-        "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
-        "#endif",
-        "ksu_handle_faccessat", "faccessat",
-    )
-
-
-# ============================================================
-# KERNEL/REBOOT.C
-# ============================================================
-
-def patch_reboot(text):
-
-    signature = (
-        r"SYSCALL_DEFINE4\s*\(\s*reboot\s*,"
-        r"\s*int\s*,\s*magic1\s*,"
-        r"\s*int\s*,\s*magic2\s*,"
-        r"\s*unsigned\s+int\s*,\s*cmd\s*,"
-    )
-
-    if "ksu_handle_sys_reboot" not in text:
-        text = insert_declaration(
-            text, REBOOT_DECLS,
-            r"SYSCALL_DEFINE4\s*\(\s*reboot",
-            "reboot declarations",
-        )
-
-    return patch_function_adaptive(
-        text, signature,
-        "int ret = 0;",
-        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-        "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
-        "#endif",
-        "ksu_handle_sys_reboot", "sys_reboot",
-    )
-
-
-# ============================================================
-# FS/STAT.C
-# ============================================================
-
-def patch_stat(text):
-
-    # Per-symbol declaration check.
-    # FIX: original only checked "ksu_handle_stat" and then skipped
-    # the whole STAT_DECLS block, leaving newfstat_ret / fstat64_ret
-    # undeclared on kernels where ksu_handle_stat was already present.
-    need_decls = (
-        "ksu_handle_stat" not in text
-        or "ksu_handle_newfstat_ret" not in text
-        or "ksu_handle_fstat64_ret" not in text
-    )
-
-    if need_decls:
-        text = insert_declaration(
-            text, STAT_DECLS,
-            r"#if\s*!defined\(__ARCH_WANT_STAT64\)",
-            "stat declarations",
-        )
-
-        # Fallback anchor if the primary one wasn't found.
-        if "ksu_handle_newfstat_ret" not in text:
-            text = insert_declaration(
-                text, STAT_DECLS,
-                r"SYSCALL_DEFINE4\s*\(\s*newfstatat",
-                "stat declarations (fallback anchor)",
+            print_skip(
+                f"{signature}: hook already present"
             )
 
-    # ---------------- newfstatat ----------------
-    signature_newfstatat = (
-        r"SYSCALL_DEFINE4\s*\(\s*newfstatat\s*,"
-        r"\s*int\s*,\s*dfd\s*,"
-        r"\s*const\s+char\s+__user\s*\*,"
-        r"\s*filename\s*,"
-    )
+            return text
 
-    text = patch_function_adaptive(
-        text, signature_newfstatat,
-        "error = vfs_fstatat(dfd, filename, &stat, flag);",
-        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-        "\tksu_handle_stat(&dfd, &filename, &flag);\n"
-        "#endif",
-        "ksu_handle_stat", "newfstatat",
-    )
-
-    # ---------------- newfstat ----------------
-    signature_newfstat = (
-        r"SYSCALL_DEFINE2\s*\(\s*newfstat\s*,"
-        r"\s*unsigned\s+int\s*,\s*fd\s*,"
-        r"\s*struct\s+stat\s+__user\s*\*,"
-        r"\s*statbuf\s*\)"
-    )
-
-    text = patch_function_adaptive(
-        text, signature_newfstat,
-        "return error;",
-        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-        "\tksu_handle_newfstat_ret(&fd, &statbuf);\n"
-        "#endif",
-        "ksu_handle_newfstat_ret", "newfstat",
-    )
-
-    # ---------------- fstat64 ----------------
-    signature_fstat64 = (
-        r"SYSCALL_DEFINE2\s*\(\s*fstat64\s*,"
-        r"\s*unsigned\s+long\s*,\s*fd\s*,"
-        r"\s*struct\s+stat64\s+__user\s*\*,"
-        r"\s*statbuf\s*\)"
-    )
-
-    if re.search(signature_fstat64, text, re.MULTILINE | re.DOTALL):
-        text = patch_function_adaptive(
-            text, signature_fstat64,
-            "return error;",
-            "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-            "\tksu_handle_fstat64_ret(&fd, &statbuf);\n"
-            "#endif",
-            "ksu_handle_fstat64_ret", "fstat64",
+        abort(
+            f"{signature}: hook symbol exists but "
+            "expected patch block is missing. "
+            "Possible partial patch."
         )
 
-    # ---------------- fstatat64 ----------------
-    signature_fstatat64 = (
-        r"SYSCALL_DEFINE4\s*\(\s*fstatat64\s*,"
-        r"\s*int\s*,\s*dfd\s*,"
-        r"\s*const\s+char\s+__user\s*\*,"
-        r"\s*filename\s*,"
-    )
+    # --------------------------------------------------------
+    # PATCH
+    # --------------------------------------------------------
 
-    if re.search(signature_fstatat64, text, re.MULTILINE | re.DOTALL):
-        text = patch_function_adaptive(
-            text, signature_fstatat64,
-            "error = vfs_fstatat(dfd, filename, &stat, flag);",
-            "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-            "\tksu_handle_stat(&dfd, &filename, &flag);\n"
-            "#endif",
-            "ksu_handle_stat", "fstatat64",
+    count = block.count(old)
+
+    if count != 1:
+
+        abort(
+            f"{signature}: expected exactly one matching "
+            f"block, found {count}"
         )
 
-    return text
-
-
-# ============================================================
-# FS/READ_WRITE.C
-# ============================================================
-
-def patch_read_write(text):
-    """
-    Remove legacy KernelSU vfs_read hook.
-
-    BakaSU Manual Hook checker rejects:
-        ksu_vfs_read_hook
-        ksu_handle_vfs_read
-
-    The patcher removes the declaration and guarded call.
-    """
-
-    declaration_patterns = [
-        r"^[ \t]*extern[ \t]+"
-        r"bool[ \t]+ksu_vfs_read_hook"
-        r"[ \t]*__read_mostly[ \t]*;",
-
-        r"^[ \t]*extern[ \t]+"
-        r"int[ \t]+ksu_handle_vfs_read"
-        r"[ \t]*\([^;]*?\)[ \t]*;",
-    ]
-
-    call_pattern = (
-        r"^[ \t]*if[ \t]*"
-        r"\([ \t]*unlikely[ \t]*"
-        r"\([ \t]*ksu_vfs_read_hook"
-        r"[ \t]*\)[ \t]*\)[ \t]*\n"
-        r"[ \t]*ksu_handle_vfs_read"
-        r"[ \t]*\([^;]*?\)[ \t]*;"
+    block = block.replace(
+        old,
+        new,
+        1
     )
 
-    changed = False
+    print_patch(
+        f"{signature}: {hook_name}"
+    )
 
-    for pattern in declaration_patterns:
-        text, count = re.subn(pattern, "", text,
-                              flags=re.MULTILINE | re.DOTALL)
-        if count:
-            changed = True
-            log("PATCH", "Removed legacy vfs_read declaration")
+    return (
+        text[:start]
+        + block
+        + text[end:]
+    )
 
-    text, count = re.subn(call_pattern, "", text,
-                          flags=re.MULTILINE | re.DOTALL)
-    if count:
-        changed = True
-        log("PATCH", "Removed legacy vfs_read hook call")
 
-    # ---------------- Validation ----------------
-    for symbol in ("ksu_vfs_read_hook", "ksu_handle_vfs_read"):
-        if symbol in text:
-            abort(f"Legacy hook remains in fs/read_write.c: {symbol}")
+def symbol_declaration_exists(
+    text,
+    symbol
+):
 
-    if not changed:
-        log("SKIP", "fs/read_write.c: legacy hook absent")
+    pattern = re.compile(
+        r"(?m)^[ \t]*"
+        r"(?:extern\s+)?"
+        r"[^;\n]*\b"
+        + re.escape(symbol)
+        + r"\s*\([^;]*\)\s*;"
+    )
 
-    return text
+    return bool(
+        pattern.search(text)
+    )
 
 
 # ============================================================
-# SELINUX SYMBOL EXPORT
+# MANUAL HOOK DECLARATIONS
 # ============================================================
 
-SELINUX_PATCHES = {
+EXEC_DECLS = [
+
+    (
+        "ksu_handle_execveat",
+        "__attribute__((hot))\n"
+        "extern int ksu_handle_execveat(\n"
+        "    int *fd,\n"
+        "    struct filename **filename_ptr,\n"
+        "    void *argv,\n"
+        "    void *envp,\n"
+        "    int *flags\n"
+        ");"
+    ),
+
+    (
+        "ksu_handle_post_execveat",
+        "__attribute__((hot))\n"
+        "extern int ksu_handle_post_execveat(\n"
+        "    int *fd,\n"
+        "    struct filename **filename_ptr,\n"
+        "    void *argv,\n"
+        "    void *envp,\n"
+        "    int *flags,\n"
+        "    int *retval\n"
+        ");"
+    ),
+]
+
+
+OPEN_DECLS = [
+
+    (
+        "ksu_handle_faccessat",
+        "__attribute__((hot))\n"
+        "extern int ksu_handle_faccessat(\n"
+        "    int *dfd,\n"
+        "    const char __user **filename_user,\n"
+        "    int *mode,\n"
+        "    int *flags\n"
+        ");"
+    ),
+]
+
+
+STAT_DECLS = [
+
+    (
+        "ksu_handle_stat",
+        "__attribute__((hot))\n"
+        "extern int ksu_handle_stat(\n"
+        "    int *dfd,\n"
+        "    const char __user **filename_user,\n"
+        "    int *flags\n"
+        ");"
+    ),
+
+    (
+        "ksu_handle_newfstat_ret",
+        "extern void ksu_handle_newfstat_ret(\n"
+        "    unsigned int *fd,\n"
+        "    struct stat __user **statbuf_ptr\n"
+        ");"
+    ),
+
+    (
+        "ksu_handle_fstat64_ret",
+        "extern void ksu_handle_fstat64_ret(\n"
+        "    unsigned long *fd,\n"
+        "    struct stat64 __user **statbuf_ptr\n"
+        ");"
+    ),
+]
+
+
+REBOOT_DECLS = [
+
+    (
+        "ksu_handle_sys_reboot",
+        "extern int ksu_handle_sys_reboot(\n"
+        "    int magic1,\n"
+        "    int magic2,\n"
+        "    unsigned int cmd,\n"
+        "    void __user **arg\n"
+        ");"
+    ),
+]
+
+
+# ============================================================
+# MANUAL HOOK PATCHES
+# ============================================================
+
+def apply_manual_hook_patch(
+    text,
+    relative_path
+):
+
+    # ========================================================
+    # fs/exec.c
+    # ========================================================
+
+    if relative_path == "fs/exec.c":
+
+        declaration_anchor = (
+            "int do_execve(struct filename *filename,"
+        )
+
+        text = insert_declarations(
+            text,
+            EXEC_DECLS,
+            declaration_anchor,
+            "exec declarations"
+        )
+
+        native_old = (
+            "\treturn do_execveat_common("
+            "AT_FDCWD, filename, argv, envp, 0);"
+        )
+
+        native_new = r'''
+#ifdef CONFIG_KSU_MANUAL_HOOK
+	int retval;
+
+	ksu_handle_execveat(
+		(int *)AT_FDCWD,
+		&filename,
+		&argv,
+		&envp,
+		0
+	);
+
+	retval = do_execveat_common(
+		AT_FDCWD,
+		filename,
+		argv,
+		envp,
+		0
+	);
+
+	ksu_handle_post_execveat(
+		(int *)AT_FDCWD,
+		&filename,
+		&argv,
+		&envp,
+		0,
+		&retval
+	);
+
+	return retval;
+#else
+	return do_execveat_common(
+		AT_FDCWD,
+		filename,
+		argv,
+		envp,
+		0
+	);
+#endif
+'''
+
+        text = patch_function(
+            text,
+            "int do_execve(struct filename *filename,",
+            native_old,
+            native_new,
+            "ksu_handle_execveat("
+        )
+
+        return text
+
+    # ========================================================
+    # fs/open.c
+    # ========================================================
+
+    if relative_path == "fs/open.c":
+
+        declaration_anchor = (
+            "/*\n"
+            " * access() needs to use the real uid/gid"
+        )
+
+        text = insert_declarations(
+            text,
+            OPEN_DECLS,
+            declaration_anchor,
+            "open declarations"
+        )
+
+        signature = (
+            "SYSCALL_DEFINE3(faccessat, int, dfd, "
+            "const char __user *, filename, int, mode)"
+        )
+
+        old = (
+            "\tif (mode & ~S_IRWXO)"
+        )
+
+        new = (
+            "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+            "\tksu_handle_faccessat("
+            "&dfd, &filename, &mode, NULL);\n"
+            "#endif\n"
+            "\tif (mode & ~S_IRWXO)"
+        )
+
+        text = patch_function(
+            text,
+            signature,
+            old,
+            new,
+            "ksu_handle_faccessat("
+        )
+
+        return text
+
+    # ========================================================
+    # kernel/reboot.c
+    # ========================================================
+
+    if relative_path == "kernel/reboot.c":
+
+        declaration_anchor = (
+            "SYSCALL_DEFINE4(reboot, int, magic1, "
+            "int, magic2, unsigned int, cmd,"
+        )
+
+        text = insert_declarations(
+            text,
+            REBOOT_DECLS,
+            declaration_anchor,
+            "reboot declarations"
+        )
+
+        signature = (
+            "SYSCALL_DEFINE4(reboot, int, magic1, "
+            "int, magic2, unsigned int, cmd,"
+        )
+
+        old = "\tint ret = 0;"
+
+        new = (
+            "\tint ret = 0;\n\n"
+            "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+            "\tksu_handle_sys_reboot("
+            "magic1, magic2, cmd, &arg);\n"
+            "#endif"
+        )
+
+        text = patch_function(
+            text,
+            signature,
+            old,
+            new,
+            "ksu_handle_sys_reboot("
+        )
+
+        return text
+
+    # ========================================================
+    # fs/stat.c
+    # ========================================================
+
+    if relative_path == "fs/stat.c":
+
+        declaration_anchor = (
+            "#if !defined(__ARCH_WANT_STAT64) "
+            "|| defined(__ARCH_WANT_SYS_NEWFSTATAT)"
+        )
+
+        text = insert_declarations(
+            text,
+            STAT_DECLS,
+            declaration_anchor,
+            "stat declarations"
+        )
+
+        # ----------------------------------------------------
+        # newfstatat
+        # ----------------------------------------------------
+
+        signature_newfstatat = (
+            "SYSCALL_DEFINE4(newfstatat, int, dfd, "
+            "const char __user *, filename,"
+        )
+
+        old_newfstatat = (
+            "\terror = vfs_fstatat(dfd, filename, "
+            "&stat, flag);"
+        )
+
+        new_newfstatat = (
+            "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+            "\tksu_handle_stat("
+            "&dfd, &filename, &flag);\n"
+            "#endif\n"
+            "\terror = vfs_fstatat(dfd, filename, "
+            "&stat, flag);"
+        )
+
+        text = patch_function(
+            text,
+            signature_newfstatat,
+            old_newfstatat,
+            new_newfstatat,
+            "ksu_handle_stat("
+        )
+
+        # ----------------------------------------------------
+        # newfstat
+        # ----------------------------------------------------
+
+        signature_newfstat = (
+            "SYSCALL_DEFINE2(newfstat, unsigned int, fd, "
+            "struct stat __user *, statbuf)"
+        )
+
+        old_newfstat = "\treturn error;"
+
+        new_newfstat = (
+            "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+            "\tksu_handle_newfstat_ret("
+            "&fd, &statbuf);\n"
+            "#endif\n"
+            "\treturn error;"
+        )
+
+        text = patch_function(
+            text,
+            signature_newfstat,
+            old_newfstat,
+            new_newfstat,
+            "ksu_handle_newfstat_ret("
+        )
+
+        # ----------------------------------------------------
+        # OPTIONAL fstat64
+        # ----------------------------------------------------
+
+        signature_fstat64 = (
+            "SYSCALL_DEFINE2(fstat64, unsigned long, fd, "
+            "struct stat64 __user *, statbuf)"
+        )
+
+        if signature_fstat64 in text:
+
+            old_fstat64 = "\treturn error;"
+
+            new_fstat64 = (
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "\tksu_handle_fstat64_ret("
+                "&fd, &statbuf);\n"
+                "#endif\n"
+                "\treturn error;"
+            )
+
+            text = patch_function(
+                text,
+                signature_fstat64,
+                old_fstat64,
+                new_fstat64,
+                "ksu_handle_fstat64_ret("
+            )
+
+        else:
+
+            print_skip(
+                "fs/stat.c: fstat64 syscall not present"
+            )
+
+        # ----------------------------------------------------
+        # OPTIONAL fstatat64
+        # ----------------------------------------------------
+
+        signature_fstatat64 = (
+            "SYSCALL_DEFINE4(fstatat64, int, dfd, "
+            "const char __user *, filename,"
+        )
+
+        if signature_fstatat64 in text:
+
+            old_fstatat64 = (
+                "\terror = vfs_fstatat(dfd, filename, "
+                "&stat, flag);"
+            )
+
+            new_fstatat64 = (
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "\tksu_handle_stat("
+                "&dfd, &filename, &flag);\n"
+                "#endif\n"
+                "\terror = vfs_fstatat(dfd, filename, "
+                "&stat, flag);"
+            )
+
+            text = patch_function(
+                text,
+                signature_fstatat64,
+                old_fstatat64,
+                new_fstatat64,
+                "ksu_handle_stat("
+            )
+
+        else:
+
+            print_skip(
+                "fs/stat.c: fstatat64 syscall not present"
+            )
+
+        return text
+
+    abort(
+        f"Unsupported Manual Hook target: "
+        f"{relative_path}"
+    )
+
+
+# ============================================================
+# BAKASU SELINUX STATIC SYMBOL PATCHES
+# ============================================================
+
+SELINUX_SYMBOL_PATCHES = {
+
+    # --------------------------------------------------------
+    # security/selinux/selinuxfs.c
+    # --------------------------------------------------------
+
     "security/selinux/selinuxfs.c": [
-        ("write_op",
-         r"\bstatic\s+(?=ssize_t\s*\(\s*\*\s*write_op\s*\[\s*\]\s*\))",
-         True),
-        ("sel_handle_status_ops",
-         r"\bstatic\s+(?=const\s+struct\s+file_operations\s+"
-         r"sel_handle_status_ops\s*=)",
-         True),
-        ("sel_mutex",
-         r"\bstatic\s+(?=DEFINE_MUTEX\s*\(\s*sel_mutex\s*\))",
-         False),
+
+        {
+            "name": "write_op",
+            "pattern": (
+                r"\bstatic\s+"
+                r"(?=ssize_t\s*\(\s*\*\s*write_op\s*\[\s*\]\s*\))"
+            ),
+            "required": True,
+        },
+
+        {
+            "name": "sel_handle_status_ops",
+            "pattern": (
+                r"\bstatic\s+"
+                r"(?=const\s+struct\s+file_operations\s+"
+                r"sel_handle_status_ops\s*=)"
+            ),
+            "required": True,
+        },
+
+        {
+            "name": "sel_mutex",
+            "pattern": (
+                r"\bstatic\s+"
+                r"(?=DEFINE_MUTEX\s*\(\s*sel_mutex\s*\))"
+            ),
+            "required": False,
+        },
     ],
+
+    # --------------------------------------------------------
+    # security/selinux/ss/status.c
+    # --------------------------------------------------------
+
     "security/selinux/ss/status.c": [
-        ("selinux_status_page",
-         r"\bstatic\s+(?=struct\s+page\s*\*\s*selinux_status_page\s*;)",
-         False),
-        ("selinux_status_lock",
-         r"\bstatic\s+(?=DEFINE_MUTEX\s*\(\s*selinux_status_lock\s*\))",
-         False),
+
+        {
+            "name": "selinux_status_page",
+            "pattern": (
+                r"\bstatic\s+"
+                r"(?=struct\s+page\s*\*\s*"
+                r"selinux_status_page\s*;)"
+            ),
+            "required": False,
+        },
+
+        {
+            "name": "selinux_status_lock",
+            "pattern": (
+                r"\bstatic\s+"
+                r"(?=DEFINE_MUTEX\s*\(\s*"
+                r"selinux_status_lock\s*\))"
+            ),
+            "required": False,
+        },
     ],
+
+    # --------------------------------------------------------
+    # security/selinux/ss/services.c
+    # --------------------------------------------------------
+
     "security/selinux/ss/services.c": [
-        ("security_dump_masked_av",
-         r"\bstatic\s+(?=void\s+security_dump_masked_av\s*\()",
-         True),
-        ("context_struct_compute_av",
-         r"\bstatic\s+(?=void\s+context_struct_compute_av\s*\()",
-         True),
-        ("latest_granting",
-         r"\bstatic\s+(?=u32\s+latest_granting\s*;)",
-         False),
-        ("policy_rwlock",
-         r"\bstatic\s+(?=DEFINE_RWLOCK\s*\(\s*policy_rwlock\s*\))",
-         False),
+
+        {
+            "name": "security_dump_masked_av",
+            "pattern": (
+                r"\bstatic\s+"
+                r"(?=void\s+security_dump_masked_av\s*\()"
+            ),
+            "required": True,
+        },
+
+        {
+            "name": "context_struct_compute_av",
+            "pattern": (
+                r"\bstatic\s+"
+                r"(?=void\s+context_struct_compute_av\s*\()"
+            ),
+            "required": True,
+        },
+
+        {
+            "name": "latest_granting",
+            "pattern": (
+                r"\bstatic\s+"
+                r"(?=u32\s+latest_granting\s*;)"
+            ),
+            "required": False,
+        },
+
+        {
+            "name": "policy_rwlock",
+            "pattern": (
+                r"\bstatic\s+"
+                r"(?=DEFINE_RWLOCK\s*\(\s*policy_rwlock\s*\))"
+            ),
+            "required": False,
+        },
     ],
+
+    # --------------------------------------------------------
+    # security/selinux/hooks.c
+    # --------------------------------------------------------
+
     "security/selinux/hooks.c": [
-        ("inode_doinit_with_dentry",
-         r"\bstatic\s+(?=int\s+inode_doinit_with_dentry\s*\()",
-         True),
-        ("selinux_inode_setxattr",
-         r"\bstatic\s+(?=int\s+selinux_inode_setxattr\s*\()",
-         True),
+
+        {
+            "name": "inode_doinit_with_dentry",
+            "pattern": (
+                r"\bstatic\s+"
+                r"(?=int\s+inode_doinit_with_dentry\s*\()"
+            ),
+            "required": True,
+        },
+
+        {
+            "name": "selinux_inode_setxattr",
+            "pattern": (
+                r"\bstatic\s+"
+                r"(?=int\s+selinux_inode_setxattr\s*\()"
+            ),
+            "required": True,
+        },
+
+        # Legacy selinux_ops intentionally excluded.
+        #
+        # Kernel 4.9 vendor sources may use:
+        #
+        #   struct security_hook_list selinux_hooks[]
+        #   security_add_hooks()
+        #
+        # instead of legacy security_operations.
     ],
 }
 
 
-def patch_selinux(text, relative_path):
-    patches = SELINUX_PATCHES.get(relative_path, [])
+# ============================================================
+# SELINUX PATCH ENGINE
+# ============================================================
 
-    for symbol, pattern, required in patches:
-        matches = list(re.finditer(pattern, text, re.MULTILINE))
+def apply_selinux_symbol_patch(
+    text,
+    symbol,
+    pattern,
+    required
+):
 
-        if matches:
-            text, count = re.subn(pattern, "", text, flags=re.MULTILINE)
-            log("PATCH", f"SELinux: {symbol}, {count} occurrence(s)")
-            continue
+    matches = list(
+        re.finditer(
+            pattern,
+            text
+        )
+    )
 
-        if re.search(r"\b" + re.escape(symbol) + r"\b", text):
-            log("SKIP", f"SELinux symbol already exported: {symbol}")
-            continue
+    # --------------------------------------------------------
+    # STATIC MATCHES FOUND
+    # --------------------------------------------------------
 
-        if required:
-            abort(f"Required SELinux symbol not found: {symbol}")
+    if matches:
 
-        log("SKIP", f"Optional SELinux symbol absent: {symbol}")
+        text, count = re.subn(
+            pattern,
+            "",
+            text
+        )
+
+        if count != len(matches):
+
+            abort(
+                f"SELinux symbol {symbol}: "
+                "match count changed during replacement"
+            )
+
+        print_patch(
+            f"SELinux symbol: {symbol} "
+            f"({count} occurrence(s))"
+        )
+
+        return text
+
+    # --------------------------------------------------------
+    # NO STATIC MATCH
+    # --------------------------------------------------------
+
+    symbol_pattern = re.compile(
+        r"\b"
+        + re.escape(symbol)
+        + r"\b"
+    )
+
+    symbol_matches = list(
+        symbol_pattern.finditer(text)
+    )
+
+    # Symbol exists, but is already non-static.
+
+    if symbol_matches:
+
+        print_skip(
+            f"SELinux symbol already exported: "
+            f"{symbol}"
+        )
+
+        return text
+
+    # --------------------------------------------------------
+    # SYMBOL NOT FOUND
+    # --------------------------------------------------------
+
+    if required:
+
+        abort(
+            f"Required SELinux symbol not found: "
+            f"{symbol}"
+        )
+
+    print_skip(
+        f"Optional SELinux symbol not found: "
+        f"{symbol}"
+    )
+
+    return text
+
+
+def apply_selinux_patch(
+    text,
+    relative_path
+):
+
+    patches = SELINUX_SYMBOL_PATCHES.get(
+        relative_path
+    )
+
+    if patches is None:
+        return text
+
+    for patch in patches:
+
+        text = apply_selinux_symbol_patch(
+            text,
+            patch["name"],
+            patch["pattern"],
+            patch["required"]
+        )
 
     return text
 
@@ -905,75 +951,63 @@ def patch_selinux(text, relative_path):
 # PATCH DISPATCHER
 # ============================================================
 
-PATCH_FUNCTIONS = {
-    "fs/exec.c": patch_exec,
-    "fs/open.c": patch_open,
-    "kernel/reboot.c": patch_reboot,
-    "fs/stat.c": patch_stat,
-    "fs/read_write.c": patch_read_write,
-}
+def apply_patch(
+    text,
+    relative_path
+):
 
+    # --------------------------------------------------------
+    # MANUAL HOOKS
+    # --------------------------------------------------------
 
-def apply_patch(text, relative_path):
-    if relative_path in PATCH_FUNCTIONS:
-        text = PATCH_FUNCTIONS[relative_path](text)
+    if relative_path in (
 
-    if relative_path in SELINUX_PATCHES:
-        text = patch_selinux(text, relative_path)
+        "fs/exec.c",
+        "fs/open.c",
+        "kernel/reboot.c",
+        "fs/stat.c",
+
+    ):
+
+        text = apply_manual_hook_patch(
+            text,
+            relative_path
+        )
+
+    # --------------------------------------------------------
+    # BAKASU SELINUX
+    # --------------------------------------------------------
+
+    if relative_path in SELINUX_SYMBOL_PATCHES:
+
+        text = apply_selinux_patch(
+            text,
+            relative_path
+        )
 
     return text
 
 
 # ============================================================
-# VALIDATION
+# TARGET FILES
 # ============================================================
 
-def validate_patch(original, patched, relative_path):
-    if original == patched:
-        return True
+TARGETS = [
 
-    # ---------------- Brace balance ----------------
-    if patched.count("{") != patched.count("}"):
-        abort(f"Brace count mismatch after patch: {relative_path}")
+    # Manual Hooks
 
-    # ---------------- Legacy read hook ----------------
-    if relative_path == "fs/read_write.c":
-        for symbol in ("ksu_vfs_read_hook", "ksu_handle_vfs_read"):
-            if symbol in patched:
-                abort(f"Legacy hook validation failed: {symbol}")
+    "fs/exec.c",
+    "fs/open.c",
+    "kernel/reboot.c",
+    "fs/stat.c",
 
-    # ---------------- fs/stat.c declaration sanity ----------------
-    if relative_path == "fs/stat.c":
-        for sym in (
-            "ksu_handle_stat",
-            "ksu_handle_newfstat_ret",
-            "ksu_handle_fstat64_ret",
-        ):
-            # Only require a declaration if the symbol is actually called
-            # (i.e. appears as "sym(" outside of an extern statement).
-            # We check for at least one call site; if the only occurrence
-            # is the declaration itself, it's not called and we skip.
-            call_re = re.compile(
-                r"(?<!extern[^;]*\b)" + re.escape(sym) + r"\s*\("
-            )
+    # BakaSU SELinux
 
-            if not call_re.search(patched):
-                continue
-
-            decl_re = re.compile(
-                r"(?:extern|__attribute__)[^;]*?\b"
-                + re.escape(sym)
-                + r"\b[^;]*?;",
-                re.DOTALL,
-            )
-
-            if not decl_re.search(patched):
-                abort(
-                    f"{relative_path}: {sym} is called but has no "
-                    "extern declaration"
-                )
-
-    return True
+    "security/selinux/selinuxfs.c",
+    "security/selinux/ss/status.c",
+    "security/selinux/ss/services.c",
+    "security/selinux/hooks.c",
+]
 
 
 # ============================================================
@@ -981,130 +1015,317 @@ def validate_patch(original, patched, relative_path):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("kernel", nargs="?", default=".",
-                        help="Kernel source directory")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show changes without writing files")
-    parser.add_argument("--threshold", type=float,
-                        default=DEFAULT_THRESHOLD,
-                        help="Minimum anchor similarity")
+
+    parser = argparse.ArgumentParser(
+        description=__doc__
+    )
+
+    parser.add_argument(
+        "kernel",
+        nargs="?",
+        default=".",
+        help="Kernel source directory"
+    )
+
     args = parser.parse_args()
 
-    root = Path(args.kernel).expanduser().resolve()
+    root = Path(
+        args.kernel
+    ).expanduser().resolve()
 
-    targets = [
-        "fs/exec.c",
-        "fs/open.c",
-        "kernel/reboot.c",
-        "fs/stat.c",
-        "fs/read_write.c",
-        "security/selinux/selinuxfs.c",
-        "security/selinux/ss/status.c",
-        "security/selinux/ss/services.c",
-        "security/selinux/hooks.c",
-    ]
+    if not root.is_dir():
+
+        abort(
+            f"Kernel source directory not found: "
+            f"{root}"
+        )
 
     originals = {}
     patched = {}
 
-    # ---------------- READ ----------------
-    log("INFO", f"Kernel source: {root}")
+    # ========================================================
+    # READ FILES
+    # ========================================================
 
-    for name in targets:
-        path = root / name
+    print_info(
+        f"Kernel source: {root}"
+    )
 
-        if not path.is_file():
-            if name == "security/selinux/ss/status.c":
-                log("SKIP", f"Optional file missing: {name}")
+    print_info(
+        "Target: Linux kernel 4.9.x"
+    )
+
+    for name in TARGETS:
+
+        file_path = root / name
+
+        if not file_path.is_file():
+
+            # ------------------------------------------------
+            # OPTIONAL FILE
+            # ------------------------------------------------
+
+            if name == (
+                "security/selinux/ss/status.c"
+            ):
+
+                print_skip(
+                    f"Optional file missing: {name}"
+                )
+
                 continue
-            abort(f"Missing target file: {name}")
 
-        originals[name] = path.read_text(encoding="utf-8")
+            abort(
+                f"Missing target file: {file_path}"
+            )
 
-    # ---------------- PREPARE ----------------
-    log("INFO", "Preparing patches")
+        try:
+
+            originals[name] = (
+                file_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        except UnicodeDecodeError:
+
+            abort(
+                f"Cannot read source as UTF-8: "
+                f"{file_path}"
+            )
+
+    # ========================================================
+    # PREPARE PATCHES
+    # ========================================================
+
+    print(
+        "\n[INFO] Preparing patches...\n"
+    )
 
     for name, original in originals.items():
-        result = apply_patch(original, name)
-        validate_patch(original, result, name)
-        patched[name] = result
 
-    changed = [n for n in originals if originals[n] != patched[n]]
+        patched[name] = apply_patch(
+            original,
+            name
+        )
 
-    # ---------------- DRY RUN ----------------
-    if args.dry_run:
-        log("INFO", "Dry-run mode")
+    # ========================================================
+    # DETERMINE CHANGES
+    # ========================================================
 
-        for name in changed:
-            diff = difflib.unified_diff(
-                originals[name].splitlines(),
-                patched[name].splitlines(),
-                fromfile=name,
-                tofile=name + ".patched",
-                lineterm="",
-            )
-            print("\n".join(diff))
+    changed = [
 
-        log("DONE", f"Dry-run completed. "
-                    f"{len(changed)} file(s) would change.")
-        return
+        name
 
-    # ---------------- NOTHING TO CHANGE ----------------
+        for name in originals
+
+        if patched[name] != originals[name]
+
+    ]
+
+    # ========================================================
+    # NOTHING TO PATCH
+    # ========================================================
+
     if not changed:
-        log("DONE", "Everything already patched or no safe matches found.")
+
+        print(
+            "\n[OK] All requested patches "
+            "already appear to be applied."
+        )
+
         return
 
-    # ---------------- BACKUP ----------------
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # ========================================================
+    # CREATE BACKUPS
+    # ========================================================
+
+    timestamp = datetime.now().strftime(
+        "%Y%m%d-%H%M%S"
+    )
+
     backups = {}
 
-    for name in changed:
-        source = root / name
-        backup = source.with_name(
-            source.name + f".bak.ksu_patch.{timestamp}"
-        )
-        shutil.copy2(source, backup)
-        backups[name] = backup
-        log("BACKUP", str(backup))
+    print(
+        "\n[INFO] Creating backups...\n"
+    )
 
-    # ---------------- WRITE ----------------
+    for name in changed:
+
+        source = root / name
+
+        backup = source.with_name(
+            source.name
+            + f".bak.ksu_patch.{timestamp}"
+        )
+
+        shutil.copy2(
+            source,
+            backup
+        )
+
+        backups[name] = backup
+
+        print(
+            f"[BACKUP] {backup}"
+        )
+
+    # ========================================================
+    # WRITE PATCHES
+    # ========================================================
+
     written = []
 
     try:
+
+        print(
+            "\n[INFO] Writing patches...\n"
+        )
+
         for name in changed:
-            path = root / name
-            path.write_text(patched[name], encoding="utf-8")
+
+            file_path = root / name
+
+            file_path.write_text(
+                patched[name],
+                encoding="utf-8"
+            )
+
             written.append(name)
-            log("OK", f"Patched {name}")
 
-    except Exception:
-        log("ROLLBACK", "Restoring original files")
+            print(
+                f"[OK] Patched {name}"
+            )
+
+    except Exception as exc:
+
+        print(
+            "\n[ROLLBACK] Restoring modified files..."
+        )
+
+        rollback_errors = []
+
         for name in written:
-            shutil.copy2(backups[name], root / name)
-        raise
 
-    # ---------------- SUMMARY ----------------
-    print()
-    print("=" * 60)
-    print("PATCH COMPLETED")
-    print("=" * 60)
-    print()
-    print("Modified files:")
+            try:
+
+                shutil.copy2(
+                    backups[name],
+                    root / name
+                )
+
+                print(
+                    f"[ROLLBACK] Restored {name}"
+                )
+
+            except Exception as rollback_error:
+
+                rollback_errors.append(
+                    f"{name}: {rollback_error}"
+                )
+
+        if rollback_errors:
+
+            print(
+                "\n[ROLLBACK ERROR]"
+            )
+
+            for error in rollback_errors:
+
+                print(
+                    f"  {error}"
+                )
+
+        raise RuntimeError(
+            f"Patch write failed: {exc}"
+        )
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    print(
+        "\n"
+        + "=" * 60
+    )
+
+    print(
+        "PATCH COMPLETED SUCCESSFULLY"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "\nModified files:"
+    )
+
     for name in changed:
-        print(f"  - {name}")
-    print()
-    print("Next:")
-    print("  git diff --check")
-    print("  git diff")
-    print("  Review all changes before compiling")
-    print()
-    print("CONFIG_KALLSYMS_ALL was not modified.")
 
+        print(
+            f"  - {name}"
+        )
+
+    print(
+        "\nNext steps:"
+    )
+
+    print(
+        "  1. git diff --check"
+    )
+
+    print(
+        "  2. git diff"
+    )
+
+    print(
+        "  3. Review all changes"
+    )
+
+    print(
+        "  4. Compile the kernel"
+    )
+
+    print(
+        "\n[NOTE] CONFIG_KALLSYMS_ALL "
+        "was not modified."
+    )
+
+    print(
+        "[NOTE] Optional SELinux symbols "
+        "are skipped when unavailable."
+    )
+
+    print(
+        "[NOTE] Required SELinux symbols "
+        "must exist in the source."
+    )
+
+    print(
+        "[NOTE] This script targets "
+        "Linux 4.9.x source structures."
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
+
     try:
+
         main()
-    except (RuntimeError, OSError, ValueError) as exc:
-        print(f"\n[ERROR] {exc}", file=sys.stderr)
+
+    except (
+        OSError,
+        RuntimeError
+    ) as exc:
+
+        print(
+            f"\n[ERROR] {exc}",
+            file=sys.stderr
+        )
+
         sys.exit(1)
