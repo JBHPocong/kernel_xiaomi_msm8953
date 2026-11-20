@@ -374,7 +374,7 @@ static struct cpufreq_frequency_table *cpufreq_parse_dt(struct device *dev,
 	for (i = 0; i < nf; i++) {
 		unsigned long f;
 
-		f = clk_round_rate(cpu_clk[cpu], data[i] * 1000);
+		f = data[i]; /* BYPASS CLK_ROUND_RATE FOR OC */
 		if (IS_ERR_VALUE(f))
 			break;
 		f /= 1000;
